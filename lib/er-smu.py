@@ -392,16 +392,19 @@ def game_burns(exe, lay, secs):
 def run_phase(smu, burns, secs, probe_cpu, emit, name):
     """Waits for er-burn processes while sampling once a second: the probe CPU's clock,
     the CPU voltage, Tctl. Stops them early at the voltage cap or T_ABORT. Returns
-    (reason it stopped early or None, stats)."""
+    (reason it stopped early or None, stats). The clock only counts while every burn
+    has over a second left: a CPU that's done reads its idle clock (~1.4 GHz)."""
     emit("phase", name=name, secs=secs)
-    t0, reason, samples = time.monotonic(), None, []
+    t0, reason, samples, clock = time.monotonic(), None, [], 0
     try:
         while any(b.poll() is None for b in burns) and time.monotonic() - t0 < secs + 15:
             time.sleep(1)
             t = round(time.monotonic() - t0)
             mhz, mv, temp = effective_mhz([probe_cpu])[0], smu.cpu_mv(), tctl()
-            samples.append((t, mhz, mv, temp))
-            emit("sample", phase=name, t=min(t, secs), secs=secs, mhz=round(mhz), mv=mv, tctl=round(temp))
+            loaded = t < secs - 1 and all(b.poll() is None for b in burns)
+            clock = mhz if loaded else clock
+            samples.append((t, mhz if loaded else None, mv, temp))
+            emit("sample", phase=name, t=min(t, secs), secs=secs, mhz=round(clock), mv=mv, tctl=round(temp))
             if mv > VMAX:
                 reason = f"CPU voltage {mv} mV, over the {VMAX} mV cap"
             elif temp >= T_ABORT:
@@ -418,9 +421,10 @@ def run_phase(smu, burns, secs, probe_cpu, emit, name):
     bad = sorted({int(c) for c in re.findall(r"CPU (\d+): (?:wrong result|\d+ errors)", text)})
     if not reason and any(b.returncode == 1 for b in burns):
         reason = "er-burn couldn't run: " + " ".join(l for l in text.splitlines() if "can't" in l)
-    steady = [s for s in samples if s[0] > 2] or samples
+    clocks = [(t, mhz) for t, mhz, _, _ in samples if mhz is not None]
+    steady = [mhz for t, mhz in clocks if t > 2] or [mhz for _, mhz in clocks]
     return reason, {"errors": errors, "bad_cpus": bad,
-                    "low": round(min((s[1] for s in steady), default=0)),
+                    "low": round(min(steady, default=0)),
                     "peak_mv": max((s[2] for s in samples), default=0),
                     "peak_t": round(max((s[3] for s in samples), default=0))}
 
