@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+# built locally
+lib/er-burn
+research/membench
+wine/bench/*.exe
+# never commit logs, saves or perf data (they hold paths and account IDs)
+logs/
+saves/
+*.data
+*.csv

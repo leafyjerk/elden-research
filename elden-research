@@ -1,0 +1,1168 @@
+#!/usr/bin/env python3
+"""elden-research: Elden Ring at a locked 60 FPS on the AMD BC-250 (CachyOS).
+
+  ./elden-research              menu
+  ./elden-research install      everything, step by step (re-run it to continue where it stopped)
+  ./elden-research check        preflight checks only (changes nothing)
+  ./elden-research status       what's installed, Steam's settings, the last game session
+  ./elden-research oc-test [--pace quick|normal|thorough] [--max 3900]
+                                the overclock safety test (again)
+  ./elden-research oc on|off    the OC test's pick while the game runs, or stock clocks
+  ./elden-research proton       build (or rebuild) the patched Proton
+  ./elden-research steam        the Steam steps, and a check that Steam saved them
+  ./elden-research bench        benchmark helpers (snapshot / restore / compare)
+  ./elden-research uninstall    remove everything this tool installed
+
+Run it as your normal user; it asks for sudo when a step needs root.
+"""
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+VERSION = "1.0"
+REPO = Path(__file__).resolve().parent
+LIB, WINE, RESEARCH = REPO / "lib", REPO / "wine", REPO / "research"
+HOME = Path.home()
+
+
+def xdg(var, default):
+    return Path(os.environ.get(var) or HOME / default)
+
+
+DATA = xdg("XDG_DATA_HOME", ".local/share") / "elden-research"
+CONFIG = xdg("XDG_CONFIG_HOME", ".config") / "elden-research" / "config"
+STATE = xdg("XDG_STATE_HOME", ".local/state") / "elden-research" / "state.json"
+CACHE = xdg("XDG_CACHE_HOME", ".cache") / "elden-research"
+LAUNCHER = DATA / "er-launch.sh"
+STEAM = HOME / ".local/share/Steam"
+STOCK = Path("/usr/share/steam/compatibilitytools.d/proton-cachyos-slr")
+TOOL = STEAM / "compatibilitytools.d/proton-cachyos-slr-er"
+TOOL_NAME = "proton-cachyos-slr-er"
+NTDLL = "files/lib/wine/x86_64-unix/ntdll.so"
+APPID = "1245620"
+OC_STATE = Path("/var/lib/elden-research/oc-test.json")
+MANIFEST = Path("/etc/elden-research/manifest")
+TESTED_PROTON = "cachyos-11.0-20261015-slr"
+
+# --- terminal output -------------------------------------------------------------------
+
+TTY = sys.stdout.isatty()
+COLOR = TTY and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
+ANSI = re.compile(r"\033\[[0-9;]*m")
+
+
+def paint(code, s):
+    return f"\033[{code}m{s}\033[0m" if COLOR else str(s)
+
+
+def gold(s): return paint("38;5;178", s)
+def amber(s): return paint("38;5;214", s)
+def dim(s): return paint("2", s)
+def bold(s): return paint("1", s)
+def green(s): return paint("32", s)
+def red(s): return paint("31", s)
+def yellow(s): return paint("33", s)
+
+
+MARK = {"ok": green("✓"), "warn": yellow("!"), "fail": red("✗"), "info": dim("·"), "skip": dim("–")}
+SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+FONT = {
+    "E": ["███████╗", "██╔════╝", "█████╗  ", "██╔══╝  ", "███████╗", "╚══════╝"],
+    "L": ["██╗     ", "██║     ", "██║     ", "██║     ", "███████╗", "╚══════╝"],
+    "D": ["██████╗ ", "██╔══██╗", "██║  ██║", "██║  ██║", "██████╔╝", "╚═════╝ "],
+    "N": ["███╗   ██╗", "████╗  ██║", "██╔██╗ ██║", "██║╚██╗██║", "██║ ╚████║", "╚═╝  ╚═══╝"],
+    "R": ["██████╗ ", "██╔══██╗", "██████╔╝", "██╔══██╗", "██║  ██║", "╚═╝  ╚═╝"],
+    "S": ["███████╗", "██╔════╝", "███████╗", "╚════██║", "███████║", "╚══════╝"],
+    "A": [" █████╗ ", "██╔══██╗", "███████║", "██╔══██║", "██║  ██║", "╚═╝  ╚═╝"],
+    "C": [" ██████╗", "██╔════╝", "██║     ", "██║     ", "╚██████╗", " ╚═════╝"],
+    "H": ["██╗  ██╗", "██║  ██║", "███████║", "██╔══██║", "██║  ██║", "╚═╝  ╚═╝"],
+}
+GRADIENT = (229, 228, 221, 220, 214, 208)  # light gold at the top to amber at the bottom
+
+
+def width():
+    return max(60, min(shutil.get_terminal_size((80, 24)).columns, 100))
+
+
+def vlen(s):
+    return len(ANSI.sub("", s))
+
+
+def fit(s, n):
+    """Cuts s to n visible characters, keeping its color codes."""
+    out, used = [], 0
+    for part in re.split(r"(\033\[[0-9;]*m)", s):
+        if ANSI.fullmatch(part):
+            out.append(part)
+        else:
+            out.append(part[:max(0, n - used)])
+            used += len(out[-1])
+    return "".join(out) + ("\033[0m" if COLOR else "")
+
+
+def banner():
+    print()
+    for word in ("ELDEN", "RESEARCH"):
+        for row in range(6):
+            line = "".join(FONT[ch][row] for ch in word)
+            print("  " + paint(f"38;5;{GRADIENT[row]}", line))
+    rule = "─" * 19
+    print(f"  {dim(rule)} {amber('✦')} {dim(rule)} {amber('✦')} {dim(rule)}")
+    print(f"  {gold('a locked 60 FPS for Elden Ring on the AMD BC-250')}  {dim('· CachyOS · v' + VERSION)}")
+    print()
+
+
+def header(title):
+    print()
+    print(f"  {amber('✦')} {bold(title)}")
+    print("  " + dim("─" * (width() - 4)))
+
+
+def bar(frac, n=24):
+    full = max(0, min(n, round(frac * n)))
+    return gold("█" * full) + dim("░" * (n - full))
+
+
+def step_header(i, n, title):
+    w = width()
+    print()
+    print(gold("━" * w))
+    left = f" {bold(f'STEP {i}/{n}')} {dim('·')} {bold(title)}"
+    right = f"{bar((i - 1) / n)} {round(100 * (i - 1) / n):3}% "
+    print(left + " " * max(1, w - vlen(left) - vlen(right)) + right)
+    print(gold("━" * w))
+
+
+def say(level, text, detail=""):
+    print(f"  {MARK[level]} {text}" + (f"  {dim(detail)}" if detail else ""))
+
+
+def item(level, label, detail):
+    """A status row: label column, then the detail (dim when it's fine)."""
+    print(f"  {MARK[level]} {label:<19}{dim(detail) if level in ('ok', 'info') else detail}")
+
+
+def note(text):
+    for line in text.splitlines():
+        print(f"    {dim(line)}" if line.strip() else "")
+
+
+def live(text):
+    if TTY:
+        sys.stdout.write("\r\033[K" + fit(text, width() - 1))
+        sys.stdout.flush()
+
+
+def live_done():
+    if TTY:
+        sys.stdout.write("\r\033[K")
+        sys.stdout.flush()
+
+
+def mmss(s):
+    s = int(s)
+    return f"{s // 60}:{s % 60:02}"
+
+
+def ask(question, default=True):
+    if not sys.stdin.isatty():
+        return default
+    hint = "[Y/n]" if default else "[y/N]"
+    while True:
+        try:
+            a = input(f"  {amber('?')} {question} {dim(hint)} ").strip().lower()
+        except EOFError:
+            return default
+        if not a:
+            return default
+        if a in ("y", "yes"):
+            return True
+        if a in ("n", "no"):
+            return False
+
+
+def pause(text="Press Enter to continue"):
+    if sys.stdin.isatty():
+        try:
+            input(f"  {dim(text)} ")
+        except EOFError:
+            pass
+
+
+# --- helpers ---------------------------------------------------------------------------
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def sudo_ready():
+    """Asks for the sudo password up front, so it doesn't interrupt a progress display."""
+    if run(["sudo", "-n", "true"]).returncode == 0:
+        return True
+    print(f"  {dim('sudo asks for your password for this step:')}")
+    return subprocess.run(["sudo", "-v"]).returncode == 0
+
+
+def sudo_stream(args):
+    """Runs a root command, printing its output indented. Returns its exit status."""
+    p = subprocess.Popen(["sudo", *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    for line in p.stdout:
+        print("    " + dim(line.rstrip()))
+    return p.wait()
+
+
+def run_live(cmd, title, parse=None, env=None):
+    """Runs cmd with a spinner, the elapsed time and the latest output line (or what
+    `parse` makes of each line). Returns (exit status, all output lines)."""
+    lines, status = [], ""
+    # The child appends through its own file description, so reading here never moves
+    # the offset it writes at.
+    with tempfile.NamedTemporaryFile("r") as out:
+        with open(out.name, "a") as child_out:
+            p = subprocess.Popen(cmd, stdout=child_out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env)
+        t0, pos, i = time.monotonic(), 0, 0
+        while True:
+            done = p.poll() is not None
+            out.seek(pos)
+            chunk = out.read()
+            pos = out.tell()
+            for line in chunk.splitlines():
+                line = line.rstrip()
+                lines.append(line)
+                if line.strip():
+                    status = parse(line, status) if parse else line
+            if done:
+                break
+            live(f"  {amber(SPIN[i % len(SPIN)])} {title} {dim(mmss(time.monotonic() - t0))}  {status}")
+            if not TTY and i % 150 == 0:
+                print(f"  ... {title} {mmss(time.monotonic() - t0)} {ANSI.sub('', status)}", flush=True)
+            i += 1
+            time.sleep(0.12)
+    live_done()
+    return p.returncode, lines
+
+
+def load_state():
+    try:
+        return json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        return {"steps": {}}
+
+
+def save_state(state):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(state, indent=1))
+
+
+def oc_state():
+    try:
+        return json.loads(OC_STATE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def proton_tag(tool):
+    try:
+        return (tool / "version").read_text().split()[1]
+    except (OSError, IndexError):
+        return None
+
+
+def tool_patched():
+    try:
+        return b"WINE_ER_POOL" in (TOOL / NTDLL).read_bytes()
+    except OSError:
+        return False
+
+
+def tool_display_name():
+    try:
+        m = re.search(r'"display_name"\s+"([^"]*)"', (TOOL / "compatibilitytool.vdf").read_text())
+        return m[1] if m else TOOL_NAME
+    except OSError:
+        return "proton-cachyos-11.0-20261015 er-wine (Elden Ring patch)"
+
+
+def game_running():
+    return run(["pgrep", "-x", "eldenring.exe"]).returncode == 0
+
+
+def smu_module():
+    """lib/er-smu.py as a module, for its topology helpers (they only read sysfs)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("er_smu", LIB / "er-smu.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# --- settings file -----------------------------------------------------------------------
+
+CONFIG_TEMPLATE = """\
+# elden-research settings, read by er-launch.sh at every game launch.
+# An ER_* variable in Steam's launch options overrides the value here for that launch, e.g.
+#   ER_OC=0 "{launcher}" %command%
+#
+# Thread layout, from this machine's CPU topology: the main thread, the render threads,
+# the other game threads, and wineserver (on the main thread's L3 cache).
+ER_LAYOUT=split
+ER_MAIN={main}
+ER_GX={gx}
+ER_REST={rest}
+ER_WS={rest}
+# 1 = the main thread's SMT sibling goes offline while the game runs.
+ER_SMT_OFF=1
+# 1 = CPU overclock while the game runs: the step this machine passed in the OC safety
+# test (elden-research oc on / oc off).
+ER_OC=0
+# Thermal guard: the OC goes off after 15 s at or above this CPU temperature (C).
+ER_OC_TMAX=88
+# Patched Proton: the main thread spins up to ER_SPIN us before sleeping (0 = off), and
+# ER_POOL fresh events wait in its event pool (0 = off). Stock Proton ignores both.
+ER_SPIN=20
+ER_POOL=128
+# 1 = scx_lavd scheduler while the game runs.
+ER_SCX=1
+# 1 = push other apps' memory to swap when the game starts.
+ER_RECLAIM=1
+# Display refresh rate while playing (KDE Plasma only; empty = leave it alone).
+ER_REFRESH=60
+# 1 = MangoHud overlay visible (Shift_R+F12 toggles it; the FPS log runs either way).
+ER_HUD=1
+# 1 = research profile 220 s into each session (needs perf; costs ~1 FPS while it runs).
+ER_PROFILE=0
+"""
+
+
+def read_config():
+    try:
+        return dict(re.findall(r"^(ER_[A-Z_]+)=(.*)$", CONFIG.read_text(), re.M))
+    except OSError:
+        return {}
+
+
+def set_config(**values):
+    """Changes KEY=value lines in place (comments and other keys stay as they are)."""
+    text = CONFIG.read_text()
+    for k, v in values.items():
+        text, n = re.subn(rf"^{k}=.*$", f"{k}={v}", text, flags=re.M)
+        if not n:
+            text += f"{k}={v}\n"
+    CONFIG.write_text(text)
+
+
+# --- Steam -------------------------------------------------------------------------------
+
+def vdf(text):
+    """Parses Valve's KeyValues text format into nested dicts."""
+    root = cur = {}
+    stack, key = [], None
+    for s, brace in re.findall(r'"((?:[^"\\]|\\.)*)"|([{}])', text):
+        if brace == "{":
+            new = {}
+            cur[key or ""] = new
+            stack.append(cur)
+            cur, key = new, None
+        elif brace == "}":
+            cur, key = (stack.pop() if stack else root), None
+        elif key is None:
+            key = s
+        else:
+            cur[key] = s.replace('\\"', '"').replace("\\\\", "\\")
+            key = None
+    return root
+
+
+def vget(d, *path):
+    for p in path:
+        if not isinstance(d, dict):
+            return None
+        d = next((v for k, v in d.items() if k.lower() == p.lower()), None)
+    return d
+
+
+def library_dirs():
+    dirs = [STEAM]
+    try:
+        lf = vdf((STEAM / "steamapps/libraryfolders.vdf").read_text(errors="replace"))
+        for v in (vget(lf, "libraryfolders") or {}).values():
+            if isinstance(v, dict) and v.get("path"):
+                dirs.append(Path(v["path"]))
+    except OSError:
+        pass
+    return list(dict.fromkeys(dirs))
+
+
+def game_library():
+    return next((d for d in library_dirs() if (d / f"steamapps/appmanifest_{APPID}.acf").exists()), None)
+
+
+def steam_settings():
+    """What Steam has saved for Elden Ring: (compat tool name, launch options). Steam
+    writes these files when it exits, so a change made in the client shows up after that."""
+    tool = opts = None
+    try:
+        cfg = vdf((STEAM / "config/config.vdf").read_text(errors="replace"))
+        m = vget(cfg, "InstallConfigStore", "Software", "Valve", "Steam", "CompatToolMapping", APPID)
+        tool = vget(m, "name") if isinstance(m, dict) else None
+    except OSError:
+        pass
+    configs = sorted(STEAM.glob("userdata/*/config/localconfig.vdf"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for lc in configs:
+        apps = vget(vdf(lc.read_text(errors="replace")), "UserLocalConfigStore", "Software", "Valve", "Steam", "apps")
+        app = vget(apps, APPID)
+        if isinstance(app, dict):
+            opts = vget(app, "LaunchOptions") or ""
+            break
+    return tool, opts
+
+
+def launch_line():
+    return f'"{LAUNCHER}" %command%'
+
+
+def steam_check(print_it=True):
+    tool, opts = steam_settings()
+    results = []
+    if tool == TOOL_NAME:
+        results.append(("ok", "Compatibility tool", tool_display_name()))
+    elif tool:
+        results.append(("warn", "Compatibility tool", f"{tool} (not the patched one: pick {tool_display_name()})"))
+    else:
+        results.append(("warn", "Compatibility tool", "not set yet (or Steam hasn't saved it: it saves when it exits)"))
+    if opts and str(LAUNCHER) in opts and "%command%" in opts:
+        extra = opts.replace(launch_line(), "").replace(str(LAUNCHER), "").replace("%command%", "").strip(' "')
+        results.append(("ok", "Launch options", "er-launch.sh" + (f" (+ {extra})" if extra else "")))
+    elif opts and "er-launch.sh" in opts:
+        results.append(("warn", "Launch options", "uses an older er-launch.sh: " + opts))
+    else:
+        results.append(("warn", "Launch options", "not set yet" + (f" (now: {opts})" if opts else "")))
+    if print_it:
+        for r in results:
+            item(*r)
+    return all(r[0] == "ok" for r in results)
+
+
+def steam_steps():
+    name = tool_display_name()
+    print(f"""
+  {bold('1.')} Quit Steam completely: Steam menu → {bold('Exit')} (closing the window isn't enough),
+     then start it again. Steam only looks for new compatibility tools when it starts.
+  {bold('2.')} Library → right-click {bold('ELDEN RING')} → Properties → {bold('Compatibility')}:
+     tick "Force the use of a specific Steam Play compatibility tool" and pick
+       {gold(name)}
+  {bold('3.')} Properties → {bold('General')} → Launch Options, paste:
+       {gold(launch_line())}
+  {bold('4.')} Play. Graphics settings don't change the FPS on this box (the CPU's main thread
+     is the limit), so keep High. The first launch after a Proton change rebuilds shaders.
+  {bold('5.')} After the first session: {gold('./elden-research status')} checks the log.
+
+  {dim('Gaming mode (Big Picture): the game page → ⚙ → Properties → the same two tabs.')}""")
+
+
+# --- checks ------------------------------------------------------------------------------
+
+# command -> package (pacman), by feature
+PACKAGES = {
+    "run": {"scxctl": "scx-tools", "scx_loader": "scx-scheds", "mangohud": "mangohud"},
+    "oc": {"gcc": "gcc"},
+    "proton": {"git": "git", "clang": "clang", "ld.lld": "lld", "bison": "bison", "flex": "flex",
+               "perl": "perl", "curl": "curl", "make": "base-devel", "autoreconf": "base-devel",
+               "objdump": "binutils"},
+}
+
+
+def missing_packages(*features):
+    return sorted({pkg for f in features for cmd, pkg in PACKAGES[f].items() if not shutil.which(cmd)})
+
+
+def preflight():
+    """Returns [(level, label, detail)]. Changes nothing."""
+    r = []
+    cpu = open("/proc/cpuinfo").read()
+    model = re.search(r"^model name\s*: (.*)$", cpu, re.M)
+    model = model[1] if model else "unknown"
+    n = os.cpu_count()
+    bios = Path("/sys/class/dmi/id/bios_version")
+    bios = bios.read_text().strip() if bios.exists() else "?"
+    if "BC-250" not in model:
+        r.append(("fail", "Hardware", f"{model}: this tool is for the AMD BC-250 only"))
+    elif n >= 16:
+        r.append(("ok", "Hardware", f"AMD BC-250 · 8 cores / {n} threads (unlocked) · BIOS {bios}"))
+    else:
+        r.append(("warn", "Hardware", f"AMD BC-250 · {n // 2} cores: works, but the layout is untested with "
+                                      "6 cores, and unlocking 8 gave ~+3 FPS (README → 8 cores)"))
+    if "BC-250" in model and not re.match(r"P[35]\.", bios):
+        r.append(("warn", "BIOS", f"{bios}: the OC code is known to work on P3.00 and P5.00"))
+    osr = dict(re.findall(r'^(\w+)="?([^"\n]*)"?$', Path("/etc/os-release").read_text(), re.M))
+    kernel = os.uname().release
+    if osr.get("ID") == "cachyos":
+        r.append(("ok", "OS", f"CachyOS · kernel {kernel}"))
+    elif "arch" in (osr.get("ID", "") + osr.get("ID_LIKE", "")):
+        r.append(("warn", "OS", f"{osr.get('NAME', '?')}: Arch-based but not CachyOS (untested)"))
+    else:
+        r.append(("fail", "OS", f"{osr.get('NAME', '?')}: needs CachyOS (pacman, proton-cachyos-slr)"))
+    if Path("/sys/kernel/sched_ext").exists():
+        r.append(("ok", "Scheduler", "sched_ext in the kernel (scx_lavd can run)"))
+    else:
+        r.append(("warn", "Scheduler", "no sched_ext: scx_lavd won't run (the CachyOS kernel has it)"))
+    try:
+        mod = smu_module()
+        temp = mod.tctl()
+        r.append(("ok" if temp < 70 else "warn", "Temperature",
+                  f"{temp:.0f} °C idle" + ("" if temp < 70 else ": hot for idle, check the fan on the heatsink")))
+        lay = mod.layout()
+        r.append(("ok", "CPU layout", f"main thread {lay['main']}, other game threads "
+                                      f"{mod.fmt_cpus(lay['core0'] + lay['rest'])}, render {mod.fmt_cpus(lay['gx'])}"))
+    except Exception as e:  # noqa: BLE001 - shown as a warning, the rest still runs
+        r.append(("warn", "Sensors", f"couldn't read the topology or k10temp: {e}"))
+    if (HOME / ".var/app/com.valvesoftware.Steam").exists() and not (STEAM / "steamapps").exists():
+        r.append(("fail", "Steam", "Flatpak Steam isn't supported: install the native steam package"))
+    elif (STEAM / "steamapps").exists():
+        r.append(("ok", "Steam", f"native, {STEAM}"))
+    else:
+        r.append(("fail", "Steam", f"not found at {STEAM}"))
+    lib = game_library()
+    r.append(("ok", "Elden Ring", f"installed ({lib})") if lib else ("fail", "Elden Ring", "not installed in Steam"))
+    tag = proton_tag(STOCK)
+    if not tag:
+        r.append(("fail", "Proton", "proton-cachyos-slr isn't installed (the packages step installs it)"))
+    elif tag == TESTED_PROTON:
+        r.append(("ok", "Proton", f"proton-cachyos-slr {tag} (the tested version)"))
+    else:
+        r.append(("warn", "Proton", f"proton-cachyos-slr {tag}: untested (tested: {TESTED_PROTON}); the build "
+                                    "refuses a mismatched result, so it's safe to try"))
+    groups = run(["id", "-nG"]).stdout.split()
+    if os.geteuid() == 0:
+        r.append(("fail", "User", "run this as your normal user, not root (it asks for sudo itself)"))
+    elif shutil.which("sudo") and ("wheel" in groups or "sudo" in groups):
+        r.append(("ok", "User", f"{os.environ.get('USER', '?')} (sudo works through the wheel group)"))
+    else:
+        r.append(("warn", "User", "not in the wheel group: the system steps need sudo"))
+    if not os.environ.get("XDG_RUNTIME_DIR"):
+        r.append(("warn", "Session", "no systemd user session: the launcher's watcher falls back to setsid"))
+    free = shutil.disk_usage(HOME).free / 2**30
+    fs = run(["stat", "-f", "-c", "%T", str(HOME)]).stdout.strip()
+    need = 1.5 if fs == "btrfs" else 3.5
+    r.append(("ok" if free >= need else "warn", "Disk", f"{free:.0f} GB free in {HOME} ({fs}; the build needs "
+                                                       f"~{need} GB)"))
+    miss = missing_packages("run", "oc", "proton") + ([] if tag else ["proton-cachyos-slr"])
+    r.append(("ok", "Packages", "all there") if not miss else
+             ("warn", "Packages", "missing: " + " ".join(miss) + " (the packages step installs them)"))
+    if game_running():
+        r.append(("warn", "Elden Ring", "is running: quit it before installing"))
+    legacy = Path("/usr/local/bin/er-smu").exists() and not MANIFEST.exists()
+    if legacy:
+        r.append(("info", "Old setup", "files from the research version found; install moves them aside"))
+    return r
+
+
+def show_checks(results):
+    w = max(len(label) for _, label, _ in results)
+    for level, label, detail in results:
+        print(f"  {MARK[level]} {label:<{w}}  {dim(detail) if level in ('ok', 'info') else detail}")
+
+
+# --- install steps -----------------------------------------------------------------------
+
+def step_check(state):
+    results = preflight()
+    show_checks(results)
+    fails = [r for r in results if r[0] == "fail"]
+    if fails:
+        print()
+        say("fail", "Fix the ✗ items above first, then run ./elden-research install again.")
+        return "failed"
+    return "done"
+
+
+def step_packages(state):
+    miss = missing_packages("run", "oc", "proton")
+    if not proton_tag(STOCK):
+        miss.append("proton-cachyos-slr")
+    if not miss:
+        say("ok", "Everything needed is installed.")
+        return "done"
+    print(f"  Needed: {bold(' '.join(miss))}")
+    note("scx-scheds/scx-tools: the scx_lavd scheduler · mangohud: FPS overlay and logs\n"
+         "gcc: the OC test's load generator · the rest: building the patched Proton")
+    note("If pacman reports missing library versions, update the whole system first:\n"
+         "sudo pacman -Syu (installing onto an outdated system breaks programs).")
+    if not ask("Install them now with pacman?"):
+        return "failed"
+    if subprocess.run(["sudo", "pacman", "-S", "--needed", *miss]).returncode != 0:
+        say("fail", "pacman failed; see its output above.")
+        return "failed"
+    return "done"
+
+
+def step_system(state):
+    note("Permanent until uninstall: swappiness 10, watermark_scale_factor 200, and at boot:\n"
+         "interrupts + memory kernel threads on CPUs 0-1, faster khugepaged.\n"
+         "Helpers that only run while the game runs: memory compaction, SMT sibling offline,\n"
+         "the OC service (after the OC test), plus a polkit rule so you can start them.\n"
+         "Every file is listed in /etc/elden-research/manifest; existing files are backed up.")
+    if game_running():
+        say("fail", "Quit Elden Ring first.")
+        return "failed"
+    if not sudo_ready():
+        return "failed"
+    user = os.environ.get("USER") or run(["id", "-un"]).stdout.strip()
+    if sudo_stream(["bash", str(LIB / "system-setup.sh"), "install", user]) != 0:
+        say("fail", "The system setup failed (output above).")
+        return "failed"
+    return "done"
+
+
+def step_launcher(state):
+    DATA.mkdir(parents=True, exist_ok=True)
+    (DATA / "logs").mkdir(exist_ok=True)
+    for src in (LIB / "er-launch.sh", RESEARCH / "er-waits.py", RESEARCH / "er-compare.py", RESEARCH / "er-save.sh"):
+        shutil.copy2(src, DATA / src.name)
+    LAUNCHER.chmod(0o755)
+    conf = (LIB / "MangoHud.conf").read_text().replace("@LOGS@", str(DATA / "logs"))
+    (DATA / "MangoHud.conf").write_text(conf)
+    mod = smu_module()
+    lay = mod.layout()
+    rest = mod.fmt_cpus(lay["core0"] + lay["rest"])
+    if not CONFIG.exists():
+        CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG.write_text(CONFIG_TEMPLATE.format(launcher=LAUNCHER, main=lay["main"], gx=mod.fmt_cpus(lay["gx"]),
+                                                 rest=rest))
+        say("ok", f"Settings written: {CONFIG}")
+    else:
+        say("ok", f"Settings kept: {CONFIG}")
+    say("ok", f"Launcher: {LAUNCHER}")
+    say("info", f"Layout: main {lay['main']} · render {mod.fmt_cpus(lay['gx'])} · others + wineserver {rest}")
+    return "done"
+
+
+def oc_summary(st):
+    rec = st.get("recommended")
+    if st.get("testing"):
+        return "warn", f"a test was interrupted at {st['testing']['mhz']} MHz (freeze or reboot?)"
+    if rec:
+        return "ok", f"{rec['mhz']} MHz passed (peak {rec['peak_mv']} mV, {rec['game_t']} °C under the game-like load)"
+    if st:
+        return "warn", f"no OC: {st.get('result')}"
+    return "info", "not run yet"
+
+
+def show_oc_steps(st):
+    base = st.get("baseline")
+    if base:
+        say("ok" if base["peak_t"] < 80 and not base["errors"] else "warn", "3500 MHz (stock baseline)",
+            f"peak {base['peak_t']} °C, {base['errors']} wrong results")
+    for s in st.get("steps", []):
+        detail = f"scale {s['scale']}, peak {s['peak_mv']} mV, {s['peak_t']} °C"
+        say("ok" if s["ok"] else "fail", f"{s['mhz']} MHz", detail if s["ok"] else f"{s['reason']} ({detail})")
+
+
+def run_qualify(pace, max_mhz):
+    """Runs er-smu qualify as root and draws its progress. Returns the final state."""
+    burn = DATA / "bin/er-burn"
+    burn.parent.mkdir(parents=True, exist_ok=True)
+    r = run(["gcc", "-O3", "-march=native", "-pthread", "-o", str(burn), str(LIB / "er-burn.c")])
+    if r.returncode:
+        say("fail", "Couldn't build the load generator (gcc):", r.stderr.strip()[:200])
+        return None
+    pace_secs = smu_module().PACES[pace]
+    cmd = ["sudo", sys.executable, "-u", str(LIB / "er-smu.py"), "qualify", "--json", "--pace", pace,
+           "--max", str(max_mhz), "--burn", str(burn)]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    total = elapsed_done = 0
+    phase_secs, t0, i = 0, time.monotonic(), 0
+    try:
+        for line in p.stdout:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                live_done()
+                print("    " + dim(line.rstrip()))
+                continue
+            kind = ev.pop("ev")
+            if kind == "crash_found":
+                live_done()
+                say("warn", f"The last OC test didn't finish: the machine froze or rebooted at {ev['mhz']} MHz.",
+                    "That step counts as failed; only lower steps are tested.")
+            elif kind == "plan":
+                total = pace_secs["base"] + len(ev["steps"]) * (ev["cores"] * pace_secs["core"] + pace_secs["game"]) \
+                    + pace_secs["soak"]
+                say("info", f"Steps: stock baseline → {' → '.join(f'{f} MHz' for f in ev['steps']) or 'none'}"
+                            f"{' → soak' if pace_secs['soak'] else ''}",
+                    f"~{round(total / 60)} min, {ev['cores']} cores, game-like load on "
+                    f"{ev['main']} / {ev['rest']} / {ev['gx']}")
+            elif kind == "phase":
+                elapsed_done += phase_secs
+                phase_secs = ev["secs"]
+            elif kind == "sample":
+                frac = min(1, (elapsed_done + ev["t"]) / total) if total else 0
+                temp = ev["tctl"]
+                tcol = green if temp < 80 else yellow if temp < 85 else red
+                live(f"  {amber(SPIN[i % len(SPIN)])} {bar(frac, 16)} {round(100 * frac):3}%  {ev['phase']:<28} "
+                     f"{ev['t']:3}/{ev['secs']} s  {ev['mhz']} MHz  {ev['mv']} mV  {tcol(f'{temp} °C')}")
+                i += 1
+            elif kind == "step":
+                live_done()
+                detail = f"scale {ev['scale']} · peak {ev['peak_mv']} mV · {ev['peak_t']} °C"
+                say("ok" if ev["ok"] else "fail", f"{ev['mhz']} MHz " + ("passed" if ev["ok"] else f"failed: {ev['reason']}"),
+                    detail)
+            elif kind == "soak":
+                live_done()
+                say("ok" if ev["ok"] else "fail", f"{ev['mhz']} MHz soak " + ("passed" if ev["ok"] else
+                                                                               f"failed: {ev['reason'] or 'errors/heat'}"),
+                    f"peak {ev['peak_t']} °C, {ev['errors']} wrong results")
+            elif kind == "info":
+                live_done()
+                say("info", ev["msg"])
+            elif kind == "done":
+                live_done()
+                say("ok" if ev["recommended"] else "warn", f"Result: {ev['result']}",
+                    f"total {mmss(time.monotonic() - t0)}")
+            elif kind == "aborted":
+                live_done()
+                say("warn", ev["msg"])
+    except KeyboardInterrupt:
+        live_done()
+        say("warn", "Stopping the test (back to stock clocks)...")
+        p.send_signal(signal.SIGINT)  # sudo passes it on to er-smu, which goes back to stock
+        p.wait()
+    p.wait()
+    return oc_state()
+
+
+def step_octest(state, pace="normal", max_mhz=3800, again=None):
+    st = oc_state()
+    if st.get("recommended") and not st.get("testing") and again is None:
+        say("ok", "Done earlier:", oc_summary(st)[1])
+        if not ask("Run the OC test again?", default=False):
+            return "done" if read_config().get("ER_OC") == "1" else "skipped"
+    soak = smu_module().PACES[pace]["soak"]
+    print(f"""  The OC raises the CPU's max clock from 3500 MHz in 100 MHz steps (to {max_mhz}) and lowers
+  the voltage curve so the voltage stays near 1.22-1.24 V (hard cap 1.275 V). Every BC-250
+  is different, so each step has to pass on this machine:
+    {green('·')} each core alone at full load: it must hold the clock, with no wrong results
+    {green('·')} a game-like load: no wrong results, no hardware errors, CPU below 85 °C
+  {f'then a {soak // 60}-minute soak at the pick. ' if soak else ''}The load generator checks every result it computes.
+
+  {yellow('If the machine freezes or reboots during the test, power-cycle it: the OC is never')}
+  {yellow('applied at boot. Run the install again and that step counts as failed.')}
+  The test never changes the GPU, and it ends at stock clocks either way.
+  Nothing else should run meanwhile (close games and heavy apps).""")
+    if game_running():
+        say("fail", "Quit Elden Ring first.")
+        return "failed"
+    if not ask(f"Run the OC safety test now (~{'5' if pace == 'quick' else '35' if pace == 'thorough' else '15'} min)?"):
+        set_config(ER_OC=0)
+        say("skip", "Skipped: the game runs at stock clocks (./elden-research oc-test any time).")
+        return "skipped"
+    if not sudo_ready():
+        return "failed"
+    st = run_qualify(pace, max_mhz) or {}
+    rec = st.get("recommended")
+    if not rec:
+        set_config(ER_OC=0)
+        print()
+        say("info", "No OC on this machine: the game runs at stock clocks. Everything else still applies.")
+        return "skipped"
+    print()
+    show_oc_steps(st)
+    print()
+    if not ask(f"Use {rec['mhz']} MHz while Elden Ring runs (stock clocks the rest of the time)?"):
+        set_config(ER_OC=0)
+        return "skipped"
+    if not sudo_ready() or sudo_stream(["bash", str(LIB / "system-setup.sh"), "oc", str(rec["mhz"])]) != 0:
+        say("fail", "Couldn't write er-oc.service.")
+        return "failed"
+    set_config(ER_OC=1)
+    say("ok", f"OC on: {rec['mhz']} MHz while the game runs, with the thermal guard at "
+              f"{read_config().get('ER_OC_TMAX', 88)} °C.")
+    return "done"
+
+
+def build_parse(line, status):
+    m = re.match(r"=== \S+ (\d)/7 (.*)", line)
+    if m:
+        return f"{bar(int(m[1]) / 7, 12)} {m[1]}/7 {m[2]}"
+    head = status.split("  ·  ")[0] if "/7 " in status else status
+    return f"{head}  ·  {dim(line.strip()[:60])}"
+
+
+def step_proton(state, again=None):
+    tag = proton_tag(STOCK)
+    if not tag:
+        say("fail", "proton-cachyos-slr isn't installed (sudo pacman -S proton-cachyos-slr).")
+        return "failed"
+    if tool_patched() and proton_tag(TOOL) == tag and again is None:
+        say("ok", f"Done earlier: {TOOL_NAME} has the patches ({tag}).")
+        if not ask("Rebuild it?", default=False):
+            return "done"
+    elif tool_patched():
+        say("info", f"The stock Proton was updated ({proton_tag(TOOL)} → {tag}); the patched tool still works, "
+                    "and a rebuild follows the update.")
+    print(f"""  Builds Proton's ntdll.so (Wine's Unix side) with two patches for the game's main thread:
+    {green('1.')} spin up to 20 µs before sleeping on a wineserver reply or a short wait
+    {green('2.')} an event pool: a helper thread creates the ~3,600 events/s the main thread asks
+       for, and closes them, so their wineserver round trips leave the main thread
+  Only that one file changes, in a copy of proton-cachyos-slr called {TOOL_NAME};
+  the stock tool is never touched. It downloads the matching Wine source (~400 MB) from
+  CachyOS's GitHub, builds a stock and a patched ntdll.so, checks both against the shipped
+  one (exports, libraries, protocol, syscall numbers) and smoke-tests the result.""")
+    if tag != TESTED_PROTON:
+        say("warn", f"{tag} is newer than the tested {TESTED_PROTON}.",
+            "If the patch doesn't apply or a check fails, nothing is installed.")
+    miss = missing_packages("proton")
+    if miss:
+        say("fail", "Missing packages: " + " ".join(miss), "(the packages step installs them)")
+        return "failed"
+    if not ask("Build it now (~10-20 min, mostly unattended)?"):
+        say("skip", "Skipped: stock proton-cachyos-slr still works with everything else.")
+        return "skipped"
+    t0 = time.monotonic()
+    code, lines = run_live(["bash", str(WINE / "build-er-wine.sh")], "building", build_parse)
+    if code != 0 or not tool_patched():
+        say("fail", "The build stopped:")
+        for line in [l for l in lines if l.strip()][-12:]:
+            print("    " + dim(line))
+        print(f"    {dim('Logs: ' + str(CACHE / 'wine/build.log') + ' and install.log')}")
+        return "failed"
+    for line in lines:
+        if re.match(r"(exports:|patched ntdll\.so: OK|installed:|Steam shows it as:|second run:)", line):
+            say("ok", line)
+    say("ok", f"Patched Proton ready in {mmss(time.monotonic() - t0)}: {tool_display_name()}")
+    return "done"
+
+
+def step_steam(state):
+    steam_steps()
+    print()
+    if tool_patched() is False:
+        say("info", "No patched Proton yet: pick proton-cachyos-slr in step 2 instead.")
+    pause("Press Enter when that's done (or now, and check later with ./elden-research status)")
+    print()
+    if steam_check():
+        return "done"
+    note("Steam saves these settings when it exits. If you've just set them, that's\n"
+         "expected: ./elden-research status checks again later.")
+    return "skipped"
+
+
+STEPS = [
+    ("check", "Preflight checks", "~10 s", step_check),
+    ("packages", "Packages", "~1 min", step_packages),
+    ("system", "System tweaks (sudo)", "~10 s", step_system),
+    ("launcher", "Launcher + settings", "~1 s", step_launcher),
+    ("octest", "Overclock safety test (sudo)", "~15 min", step_octest),
+    ("proton", "Patched Proton", "~15 min", step_proton),
+    ("steam", "Steam setup", "you", step_steam),
+]
+
+
+def cmd_install(args):
+    banner()
+    state = load_state()
+    header("Install plan")
+    for i, (key, title, est, _) in enumerate(STEPS, 1):
+        prev = state["steps"].get(key, {}).get("status")
+        mark = {"done": MARK["ok"], "skipped": MARK["skip"], "failed": MARK["fail"]}.get(prev, dim("○"))
+        print(f"  {mark} {i}  {title:<34} {dim(est)}")
+    print()
+    note("Re-run ./elden-research install any time: finished steps are checked quickly or skipped.")
+    if not ask("Start?"):
+        return
+    t_all = time.monotonic()
+    for i, (key, title, _, fn) in enumerate(STEPS, 1):
+        step_header(i, len(STEPS), title)
+        t0 = time.monotonic()
+        try:
+            status = fn(state)
+        except KeyboardInterrupt:
+            live_done()
+            print()
+            say("warn", "Stopped. Run ./elden-research install to continue.")
+            status = "failed"
+        state["steps"][key] = {"status": status, "time": int(time.time()), "secs": round(time.monotonic() - t0)}
+        save_state(state)
+        if status == "failed":
+            break
+    finish_summary(state, time.monotonic() - t_all)
+
+
+def finish_summary(state, secs):
+    w = width()
+    print()
+    print(gold("━" * w))
+    done = sum(state["steps"].get(k, {}).get("status") in ("done", "skipped") for k, *_ in STEPS)
+    print(f" {bold('SUMMARY')}  {bar(done / len(STEPS))} {done}/{len(STEPS)}  {dim(mmss(secs))}")
+    print(gold("━" * w))
+    for key, title, _, _ in STEPS:
+        s = state["steps"].get(key, {}).get("status")
+        print(f"  {({'done': MARK['ok'], 'skipped': MARK['skip'], 'failed': MARK['fail']}).get(s, dim('○'))} {title}"
+              f"  {dim(s or 'not run')}")
+    print()
+    if done == len(STEPS):
+        print(f"  {gold('✦')} {bold('All set.')} Start Elden Ring from Steam. After a session, "
+              f"{gold('./elden-research status')} shows how it ran.")
+    else:
+        print(f"  Continue with {gold('./elden-research install')}.")
+    print()
+
+
+# --- other commands ----------------------------------------------------------------------
+
+def frame_stats(csv_path):
+    """MangoHud CSV -> avg FPS, median FPS, % of frames over 17.5 ms, worst frame, seconds."""
+    rows = csv_path.read_text(errors="replace").splitlines()
+    head = rows[2].split(",")
+    ift, iel = head.index("frametime"), head.index("elapsed")
+    ft, el = [], []
+    for r in rows[3:]:
+        f = r.split(",")
+        try:
+            ft.append(float(f[ift]))
+            el.append(int(f[iel]))
+        except (ValueError, IndexError):
+            pass
+    if len(ft) < 100:
+        return None
+    s = sorted(ft)
+    return {"avg": len(ft) / (sum(ft) / 1000), "median": 1000 / s[len(s) // 2],
+            "late": 100 * sum(x > 17.5 for x in ft) / len(ft), "worst": s[-1], "secs": (el[-1] - el[0]) / 1e9}
+
+
+def last_session():
+    log = DATA / "logs/launch.log"
+    if not log.exists():
+        return None
+    text = log.read_text(errors="replace")
+    starts = [m.start() for m in re.finditer(r"^=== \d{4}-\d\d-\d\d \d\d:\d\d:\d\d launch$", text, re.M)]
+    if not starts:
+        return None
+    block = text[starts[-1]:]
+    info = {"when": block.split("\n", 1)[0][4:-7], "lines": block.splitlines()}
+    for key, pat in (("oc", r"^CPU OC (on|failed|: no).*"), ("guard", r".*thermal guard.*"),
+                     ("smt", r"^CPU \d+ \(main thread's sibling\) offline"), ("scx", r"^scx_lavd started"),
+                     ("patched", r"^ntdll\.so: has the event pool"), ("pool", r"event pool: .*"),
+                     ("exited", r"^game exited"), ("pinned", r"^main thread -> .*"), ("proton", r"^proton: .*")):
+        m = re.search(pat, block, re.M)
+        info[key] = m[0].strip() if m else None
+    csvs = sorted((DATA / "logs").glob("eldenring_*[0-9].csv"), key=lambda p: p.stat().st_mtime)
+    info["csv"] = csvs[-1] if csvs else None
+    return info
+
+
+def cmd_status(args):
+    header("elden-research status")
+    item("ok" if MANIFEST.exists() else "warn", "System part",
+        "installed (/etc/elden-research/manifest)" if MANIFEST.exists() else "not installed (./elden-research install)")
+    cfg = read_config()
+    item("ok" if LAUNCHER.exists() else "warn", "Launcher", str(LAUNCHER) if LAUNCHER.exists() else "not installed")
+    st = oc_state()
+    level, text = oc_summary(st)
+    unit = Path("/etc/systemd/system/er-oc.service")
+    m = re.search(r"apply (\d+)", unit.read_text()) if unit.exists() else None
+    unit_mhz = m[1] if m else None
+    if cfg.get("ER_OC") == "1" and unit_mhz:
+        item("ok", "Overclock", f"{unit_mhz} MHz while the game runs · test: {text}")
+    else:
+        item(level if level != "ok" else "info", "Overclock", f"off (stock clocks) · test: {text}")
+    if tool_patched():
+        newer = proton_tag(STOCK) not in (None, proton_tag(TOOL))
+        item("warn" if newer else "ok", "Patched Proton", f"{tool_display_name()}" +
+            (f" · stock is now {proton_tag(STOCK)} (./elden-research proton to follow it)" if newer else ""))
+    else:
+        item("warn", "Patched Proton", "not built (./elden-research proton)")
+    steam_check()
+    s = last_session()
+    header("Last game session")
+    if not s:
+        say("info", "No session logged yet.")
+        return
+    item("info", "Started", s["when"] + (f" · {s['proton'][8:]}" if s["proton"] else ""))
+    item("ok" if s["patched"] else "warn", "Proton patches", "on" if s["patched"] else "not in this session's Proton")
+    if s["pool"]:
+        m = re.search(r"untracked (\d+)", s["pool"])
+        item("ok" if "helper running" in s["pool"] and m and m[1] == "0" else "warn", "Event pool",
+            ("helper ran, all closes deferred" if m and m[1] == "0" else s["pool"][:90]))
+    oc = s["oc"] or "no OC line"
+    item("ok" if oc.startswith("CPU OC on") else "info", "Overclock", oc.replace("CPU OC ", ""))
+    if s["guard"]:
+        item("warn", "Thermal guard", s["guard"])
+    item("ok" if s["smt"] else "info", "SMT sibling", "offline while playing" if s["smt"] else "online")
+    item("ok" if s["scx"] else "info", "Scheduler", "scx_lavd" if s["scx"] else "kernel default")
+    item("ok" if s["pinned"] else "warn", "Thread layout", s["pinned"] or "not pinned (did the game load?)")
+    if s["csv"]:
+        fs = frame_stats(s["csv"])
+        if fs:
+            item("ok" if fs["late"] < 5 else "warn", "FPS (MangoHud)",
+                f"{fs['avg']:.2f} avg · {fs['median']:.2f} median · {fs['late']:.1f}% of frames over 17.5 ms · "
+                f"worst {fs['worst']:.0f} ms · {fs['secs']:.0f} s ({s['csv'].name})")
+    print(f"\n  {dim('Full log: ' + str(DATA / 'logs/launch.log'))}")
+
+
+def cmd_check(args):
+    header("Preflight checks (read-only)")
+    show_checks(preflight())
+
+
+def cmd_octest(args):
+    pace, max_mhz = "normal", 3800
+    if "--pace" in args:
+        pace = args[args.index("--pace") + 1]
+    if "--max" in args:
+        max_mhz = int(args[args.index("--max") + 1])
+    if pace not in ("quick", "normal", "thorough") or not 3600 <= max_mhz <= 3900:
+        sys.exit("--pace quick|normal|thorough, --max 3600-3900")
+    if max_mhz > 3800:
+        say("warn", f"{max_mhz} MHz was never run in-game in the research (3800 was).")
+    header("Overclock safety test")
+    if not MANIFEST.exists():
+        say("warn", "The system part isn't installed yet; the test works, but the OC can't be used until it is.")
+    step_octest(load_state(), pace, max_mhz, again=True)
+
+
+def cmd_oc(args):
+    if not args or args[0] not in ("on", "off"):
+        sys.exit("usage: ./elden-research oc on|off")
+    if not CONFIG.exists():
+        sys.exit("Run ./elden-research install first.")
+    if args[0] == "off":
+        set_config(ER_OC=0)
+        say("ok", "OC off: the game runs at stock clocks from the next launch.")
+        return
+    rec = oc_state().get("recommended")
+    if not rec:
+        sys.exit("No OC test result that allows an OC: run ./elden-research oc-test")
+    if sudo_ready() and sudo_stream(["bash", str(LIB / "system-setup.sh"), "oc", str(rec["mhz"])]) == 0:
+        set_config(ER_OC=1)
+        say("ok", f"OC on: {rec['mhz']} MHz while the game runs.")
+
+
+def cmd_proton(args):
+    header("Patched Proton")
+    step_proton(load_state(), again=True)
+
+
+def cmd_steam(args):
+    header("Steam setup")
+    steam_steps()
+    print()
+    steam_check()
+
+
+def cmd_bench(args):
+    sub = args[0] if args else ""
+    if sub in ("snapshot", "restore"):
+        subprocess.run(["bash", str(RESEARCH / "er-save.sh"), sub])
+    elif sub == "compare":
+        files = args[1:] or [str(p) for p in sorted((DATA / "logs").glob("eldenring_*[0-9].csv"),
+                                                    key=lambda p: p.stat().st_mtime)[-4:]]
+        subprocess.run([sys.executable, "-I", str(RESEARCH / "er-compare.py"), *files])
+    else:
+        header("Benchmark helpers (for A/B tests; see RESEARCH.md → Method)")
+        print(f"""  ./elden-research bench snapshot   save the current game save as the benchmark save
+  ./elden-research bench restore    put it back before each benchmark run ({red('never when playing for real')})
+  ./elden-research bench compare [CSV...]   stats for MangoHud logs (default: the newest 4)
+
+  The method: load at a Site of Grace (the research used the Church of Elleh), don't touch the
+  controller, and let MangoHud's automatic 3-minute log run (it starts 90 s after launch).
+  Restore the save before every run, alternate the two settings A-B-A-B, and compare
+  "frames over 17.5 ms": near the 60 cap, the average hardly moves.""")
+
+
+def cmd_uninstall(args):
+    header("Uninstall")
+    print("""  This removes:
+    · the system part (services, helpers, polkit rule, sysctls; backed-up files are restored)
+    · the patched Proton tool (proton-cachyos-slr-er), if you agree below
+    · the launcher, settings and install state (and the logs and the Wine build cache, if you agree)
+  The stock proton-cachyos-slr and your game and saves are not touched.""")
+    if game_running():
+        sys.exit("Quit Elden Ring first.")
+    if not ask("Uninstall elden-research?", default=False):
+        return
+    if MANIFEST.exists():
+        if not sudo_ready() or sudo_stream(["bash", str(LIB / "system-setup.sh"), "uninstall"]) != 0:
+            say("fail", "The system part couldn't be removed (output above). Nothing else was changed.")
+            return
+        say("ok", "System part removed.")
+    if TOOL.exists() and "er-wine" in (TOOL / "compatibilitytool.vdf").read_text(errors="replace"):
+        tool, _ = steam_settings()
+        if tool == TOOL_NAME:
+            say("warn", "Elden Ring still uses the patched tool in Steam: switch it back (Compatibility tab).")
+        if ask(f"Remove the patched Proton tool ({TOOL})?"):
+            shutil.rmtree(TOOL)
+            say("ok", "Patched Proton tool removed.")
+    keep_logs = (DATA / "logs").exists() and not ask("Remove the game session logs too?", default=False)
+    if DATA.exists():
+        for p in DATA.iterdir():
+            if not (keep_logs and p.name in ("logs", "saves")):
+                shutil.rmtree(p) if p.is_dir() else p.unlink()
+        say("ok", "Launcher removed" + (f" (logs kept in {DATA / 'logs'})" if keep_logs else "."))
+    shutil.rmtree(CONFIG.parent, ignore_errors=True)
+    shutil.rmtree(STATE.parent, ignore_errors=True)
+    if CACHE.exists() and ask(f"Remove the Wine source/build cache ({CACHE}, ~500 MB)?"):
+        shutil.rmtree(CACHE, ignore_errors=True)
+    print(f"""
+  {bold('In Steam:')} Elden Ring → Properties → General: clear the launch options;
+  Compatibility: pick your previous Proton (e.g. proton-cachyos-slr). Reboot to get the
+  boot-time defaults back.""")
+
+
+def cmd_menu(args):
+    banner()
+    st = oc_state()
+    installed = MANIFEST.exists() and LAUNCHER.exists()
+    print(f"  {MARK['ok' if installed else 'info']} {'Installed' if installed else 'Not installed yet'}"
+          f"   {MARK[oc_summary(st)[0]]} OC: {oc_summary(st)[1]}"
+          f"   {MARK['ok' if tool_patched() else 'info']} Proton patches: {'built' if tool_patched() else 'not built'}")
+    items = [("1", "Install / continue the install", cmd_install), ("2", "Status and last session", cmd_status),
+             ("3", "Preflight checks (read-only)", cmd_check), ("4", "Overclock safety test", cmd_octest),
+             ("5", "Build the patched Proton", cmd_proton), ("6", "Steam steps", cmd_steam),
+             ("7", "Benchmark helpers", cmd_bench), ("8", "Uninstall", cmd_uninstall)]
+    print()
+    for key, text, _ in items:
+        print(f"    {gold(key)}  {text}")
+    print(f"    {gold('q')}  Quit\n")
+    try:
+        choice = input(f"  {amber('›')} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    for key, _, fn in items:
+        if choice == key:
+            return fn([])
+
+
+COMMANDS = {"install": cmd_install, "check": cmd_check, "status": cmd_status, "oc-test": cmd_octest,
+            "oc": cmd_oc, "proton": cmd_proton, "steam": cmd_steam, "bench": cmd_bench,
+            "uninstall": cmd_uninstall, "menu": cmd_menu}
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    if os.geteuid() == 0:
+        sys.exit("Run elden-research as your normal user, not with sudo: it asks for sudo itself when needed.")
+    cmd = COMMANDS.get(args[0] if args else "menu")
+    if not cmd:
+        sys.exit(__doc__)
+    try:
+        cmd(args[1:])
+    except KeyboardInterrupt:
+        live_done()
+        print()
+
+
+if __name__ == "__main__":
+    main()
