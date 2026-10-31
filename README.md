@@ -15,20 +15,21 @@
 
 # elden-research
 
-**Elden Ring at a locked 60 FPS on the AMD BC-250, on CachyOS.**
+**Elden Ring performance tuning for the AMD BC-250, on CachyOS.**
 
 One terminal tool does it all. It checks your machine, tests how far *your* CPU can overclock safely, builds a patched Proton, and tells you exactly what to set in Steam. Everything we tried along the way, including what didn't work, is in [RESEARCH.md](RESEARCH.md).
 
 ## Results
 
-Same spot (the Church of Elleh Site of Grace, a demanding view), same 8-core board, MangoHud logs:
+These numbers come from one board, the research box (8 cores, cooled as described under [Requirements](#requirements-and-assumptions)), measured with MangoHud logs. Your results will differ with your board, its cooling, the OC step your CPU passes, and where you are in the game. Treat them as examples, not a promise.
 
 | | Avg FPS | Median | 1% low | Frames over 20 ms | Frames over 17.5 ms |
 |---|---|---|---|---|---|
-| Before (only the main thread pinned) | 49.6 | – | 40.3 | 50.6% | – |
-| **After (everything here)** | **59.96** | **60.00** | **50.5** | **0.2%** | **2.8%** |
+| Benchmark, before (only the main thread pinned) | 49.6 | – | 40.3 | 50.6% | – |
+| Benchmark, after (everything here), best run | 59.96 | 60.00 | 50.5 | 0.2% | 2.8% |
+| A later session, installed with this tool | 58.58 | 59.55 | 33.7 | 2.0% | 16.9% |
 
-At the 60 FPS cap a frame is due every 16.7 ms. In the final run 97% of frames arrived on time, and most of the rest were less than 1 ms late. The very start of the project, with 6 cores and nothing tuned, was ~50 FPS with 1% lows of 32–39 in an easier open-world spot.
+The benchmark means standing still at the Church of Elleh Site of Grace (a demanding view), with the same save loaded before each run. A normal session varies more. At the 60 FPS cap a frame is due every 16.7 ms. In the best benchmark run, 97% of frames arrived on time, and most of the rest were less than 1 ms late. The very start of the project, with 6 cores and nothing tuned, was ~50 FPS with 1% lows of 32–39 in an easier open-world spot.
 
 ## What this tool changes, and what each part contributes
 
@@ -93,7 +94,19 @@ Then in Steam (the tool prints these with your exact paths):
 
 In gaming mode (Big Picture) the same settings are under the game's ⚙ → Properties.
 
+## Updating
+
+```sh
+cd elden-research
+git pull
+./elden-research install
+```
+
+Re-running the install refreshes the system part and the launcher, and keeps your settings. It asks before re-running the OC test or rebuilding Proton.
+
 ## Overclock safety
+
+**The OC is only on while Elden Ring runs.** The desktop and every other game stay at stock clocks, and it's never applied at boot.
 
 Every BC-250 is different: some CPUs won't hold a higher clock at a given voltage, and some boxes have weaker cooling. So the tool never just applies a number. It tests your machine first, and it keeps checking while you play.
 
@@ -115,6 +128,8 @@ Every BC-250 is different: some CPUs won't hold a higher clock at a given voltag
 - At each launch, `er-smu apply` checks one loaded core's clock and voltage before the game starts, and goes back to stock if either is off.
 - While the OC is on, the SMU throttles at 90 °C, which is stricter than the stock firmware's 100 °C. Separately, a **thermal guard** turns the OC off if the CPU stays at 88 °C for 15 seconds (`ER_OC_TMAX`).
 - If the game crashes or the box hangs while playing: `./elden-research oc off`, then run `./elden-research oc-test --pace thorough` (~35 min).
+
+**If your board doesn't pass,** the tool offers to use an OC anyway. You pick the step: 3600, 3700 or 3800 MHz, each listed with what the test found. Then you type `I accept`. Running a step the test didn't pass can mean crashes, freezes, lost progress or corrupted files, and more heat and wear on the board. That's your call and your risk. Everything under *While you play* still applies, and `status` marks the OC as forced. You can do this later with `./elden-research oc force`, and go back to stock with `./elden-research oc off`.
 
 The test is a screening, not a guarantee. Its load heats the CPU about as much as the game does, but the game's GPU load also heats the same chip, and the in-game guard is there for that.
 
@@ -146,6 +161,7 @@ The test is a screening, not a guarantee. Its load heats the CPU about as much a
 ./elden-research status       what's installed, Steam's settings, the last game session
 ./elden-research oc-test      the overclock safety test (--pace quick|normal|thorough, --max 3900)
 ./elden-research oc on|off    use the test's pick while the game runs, or stock clocks
+./elden-research oc force     use an OC step the test didn't pass, at your own risk
 ./elden-research proton       build/rebuild the patched Proton (e.g. after a Proton update)
 ./elden-research steam        the Steam steps, and a check that Steam saved them
 ./elden-research bench        benchmark helpers: save snapshot/restore, compare MangoHud logs

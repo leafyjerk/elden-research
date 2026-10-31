@@ -1,4 +1,4 @@
-# The research: Elden Ring at 60 FPS on a BC-250
+# The research: tuning Elden Ring on a BC-250
 
 This is everything we tried, in order: what we measured, what worked, what didn't, and why. The tool in this repository packages the parts that worked. Dates are 2026-10-25 to 2026-10-31. Every number comes from a MangoHud frame log or from a measurement tool in [research/](research/).
 
@@ -28,7 +28,7 @@ This is everything we tried, in order: what we measured, what worked, what didn'
   7. CachyOS's Proton
   8. wineserver pinned next to the main thread
   9. two patches to Proton's `ntdll.so` that take ~84% of the main thread's Wine server round trips away
-- **Result:** at the hard benchmark spot, from 49.6 FPS average with 50.6% of frames over 20 ms, to 59.96 average (median 60.00, the cap) with 0.2% over 20 ms, and 97% of frames within the 16.7 ms budget plus 0.8 ms.
+- **Result:** at the hard benchmark spot, from 49.6 FPS average with 50.6% of frames over 20 ms, to 59.96 average (median 60.00, the cap) with 0.2% over 20 ms, and 97% of frames within the 16.7 ms budget plus 0.8 ms. That was the best run, at one spot, on one board. A later session, installed with the packaged tool, measured 58.6 average (median 59.6), so expect variation.
 - **Measuring was half the work.** Near the cap, the average stops moving, the scene drifts between runs, and single hitches dominate the 1% lows. Section 3 describes the method that made 1–2% effects visible.
 
 ## 2. The machine

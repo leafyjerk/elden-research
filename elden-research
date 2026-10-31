@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""elden-research: Elden Ring at a locked 60 FPS on the AMD BC-250 (CachyOS).
+"""elden-research: Elden Ring performance tuning for the AMD BC-250 (CachyOS).
 
   ./elden-research              menu
   ./elden-research install      everything, step by step (re-run it to continue where it stopped)
@@ -8,6 +8,7 @@
   ./elden-research oc-test [--pace quick|normal|thorough] [--max 3900]
                                 the overclock safety test (again)
   ./elden-research oc on|off    the OC test's pick while the game runs, or stock clocks
+  ./elden-research oc force     an OC step the test didn't pass, at your own risk
   ./elden-research proton       build (or rebuild) the patched Proton
   ./elden-research steam        the Steam steps, and a check that Steam saved them
   ./elden-research bench        benchmark helpers (snapshot / restore / compare)
@@ -26,7 +27,7 @@ import tempfile
 import time
 from pathlib import Path
 
-VERSION = "1.0"
+VERSION = "1.1"
 REPO = Path(__file__).resolve().parent
 LIB, WINE, RESEARCH = REPO / "lib", REPO / "wine", REPO / "research"
 HOME = Path.home()
@@ -116,7 +117,7 @@ def banner():
             print("  " + paint(f"38;5;{GRADIENT[row]}", line))
     rule = "─" * 19
     print(f"  {dim(rule)} {amber('✦')} {dim(rule)} {amber('✦')} {dim(rule)}")
-    print(f"  {gold('a locked 60 FPS for Elden Ring on the AMD BC-250')}  {dim('· CachyOS · v' + VERSION)}")
+    print(f"  {gold('Elden Ring performance tuning for the AMD BC-250')}  {dim('· CachyOS · v' + VERSION)}")
     print()
 
 
@@ -746,7 +747,10 @@ def step_octest(state, pace="normal", max_mhz=3800, again=None):
         if not ask("Run the OC test again?", default=False):
             return "done" if read_config().get("ER_OC") == "1" else "skipped"
     soak = smu_module().PACES[pace]["soak"]
-    print(f"""  The OC raises the CPU's max clock from 3500 MHz in 100 MHz steps (to {max_mhz}) and lowers
+    print(f"""  {bold('The OC is only on while Elden Ring runs.')} The desktop and every other game stay at stock
+  clocks, and it's never applied at boot.
+
+  The OC raises the CPU's max clock from 3500 MHz in 100 MHz steps (to {max_mhz}) and lowers
   the voltage curve so the voltage stays near 1.22-1.24 V (hard cap 1.275 V). Every BC-250
   is different, so each step has to pass on this machine:
     {green('·')} each core alone at full load: it must hold the clock, with no wrong results
@@ -771,21 +775,68 @@ def step_octest(state, pace="normal", max_mhz=3800, again=None):
     if not rec:
         set_config(ER_OC=0)
         print()
-        say("info", "No OC on this machine: the game runs at stock clocks. Everything else still applies.")
-        return "skipped"
+        if not st.get("result"):
+            say("info", "The OC test didn't finish: the game runs at stock clocks (./elden-research oc-test any time).")
+            return "skipped"
+        say("info", "No OC step passed on this machine: the game runs at stock clocks. Everything else still applies.")
+        return oc_anyway(st) or "skipped"
     print()
     show_oc_steps(st)
     print()
     if not ask(f"Use {rec['mhz']} MHz while Elden Ring runs (stock clocks the rest of the time)?"):
         set_config(ER_OC=0)
         return "skipped"
-    if not sudo_ready() or sudo_stream(["bash", str(LIB / "system-setup.sh"), "oc", str(rec["mhz"])]) != 0:
+    return "done" if enable_oc(rec["mhz"]) else "failed"
+
+
+def enable_oc(mhz, forced=False):
+    """er-oc.service at `mhz`, and ER_OC on. `forced`: a step the test didn't pass."""
+    cmd = ["bash", str(LIB / "system-setup.sh"), "oc", str(mhz)] + (["force"] if forced else [])
+    if not sudo_ready() or sudo_stream(cmd) != 0:
         say("fail", "Couldn't write er-oc.service.")
-        return "failed"
+        return False
     set_config(ER_OC=1)
-    say("ok", f"OC on: {rec['mhz']} MHz while the game runs, with the thermal guard at "
-              f"{read_config().get('ER_OC_TMAX', 88)} °C.")
-    return "done"
+    say("ok", f"OC on: {mhz} MHz, only while Elden Ring runs (stock clocks the rest of the time).",
+        f"thermal guard {read_config().get('ER_OC_TMAX', 88)} °C · undo: ./elden-research oc off")
+    return True
+
+
+def oc_anyway(st, ask_first=True):
+    """An OC step the test didn't pass on this machine: the user's call, with the risks
+    spelled out. The in-game protections still apply. Returns "done" if the OC is on."""
+    if not sys.stdin.isatty() or ask_first and not ask("Use an OC anyway, at your own risk?", default=False):
+        return None
+    passed = {s["mhz"] for s in st.get("steps", []) if s["ok"]}
+    failed = {s["mhz"]: s["reason"] for s in st.get("steps", []) if not s["ok"]}
+    crashed = set(st.get("crashed", [])) | ({st["testing"]["mhz"]} if st.get("testing") else set())
+    rec = st.get("recommended")
+    steps = [f for f, _ in smu_module().LADDER if f <= 3800]
+    print(f"""
+  {red("The OC test hasn't passed these clocks on this machine.")} Using them anyway can mean crashes,
+  freezes, lost game progress or corrupted files, and more heat and wear on the board.
+  What still protects you:
+    {green('·')} the OC is only on while Elden Ring runs: the desktop and other games stay at stock
+    {green('·')} each launch first checks one loaded core (clock reached, under 1.275 V), else stock
+    {green('·')} the thermal guard turns it off at {read_config().get('ER_OC_TMAX', 88)} °C, and the SMU throttles at 90 °C
+    {green('·')} it's never applied at boot: a power cycle always brings back stock clocks
+  If the game crashes or the machine freezes: ./elden-research oc off
+""")
+    for n, f in enumerate(steps, 1):
+        why = ("the machine froze or rebooted here" if f in crashed else "passed" if f in passed
+               else f"failed: {failed[f]}" if f in failed else "not tested")
+        print(f"    {gold(str(n))}  {f} MHz  {dim(why)}")
+    try:
+        pick = input(f"\n  {amber('?')} Which step? {dim('[1]')} ").strip() or "1"
+        if pick not in [str(n) for n in range(1, len(steps) + 1)]:
+            raise ValueError
+        mhz = steps[int(pick) - 1]
+        ok = input(f"  {amber('?')} Type {bold('I accept')} to use {mhz} MHz at your own risk: ").strip().lower() == "i accept"
+    except (ValueError, EOFError):
+        ok = False
+    if not ok:
+        say("skip", "Not changed: the game runs at stock clocks.")
+        return None
+    return "done" if enable_oc(mhz, forced=not (rec and mhz in passed and mhz <= rec["mhz"])) else None
 
 
 def build_parse(line, status):
@@ -968,10 +1019,12 @@ def cmd_status(args):
     st = oc_state()
     level, text = oc_summary(st)
     unit = Path("/etc/systemd/system/er-oc.service")
-    m = re.search(r"apply (\d+)", unit.read_text()) if unit.exists() else None
-    unit_mhz = m[1] if m else None
-    if cfg.get("ER_OC") == "1" and unit_mhz:
-        item("ok", "Overclock", f"{unit_mhz} MHz while the game runs · test: {text}")
+    unit_text = unit.read_text() if unit.exists() else ""
+    m = re.search(r"apply (\d+)", unit_text)
+    if cfg.get("ER_OC") == "1" and m:
+        forced = "forced" in unit_text
+        item("warn" if forced else "ok", "Overclock", f"{m[1]} MHz, only while Elden Ring runs"
+            + (" · forced: the test didn't pass it" if forced else "") + f" · test: {text}")
     else:
         item(level if level != "ok" else "info", "Overclock", f"off (stock clocks) · test: {text}")
     if tool_patched():
@@ -1030,20 +1083,23 @@ def cmd_octest(args):
 
 
 def cmd_oc(args):
-    if not args or args[0] not in ("on", "off"):
-        sys.exit("usage: ./elden-research oc on|off")
+    if not args or args[0] not in ("on", "off", "force"):
+        sys.exit("usage: ./elden-research oc on|off|force")
     if not CONFIG.exists():
         sys.exit("Run ./elden-research install first.")
     if args[0] == "off":
         set_config(ER_OC=0)
         say("ok", "OC off: the game runs at stock clocks from the next launch.")
         return
+    if args[0] == "force":
+        header("Overclock at your own risk")
+        oc_anyway(oc_state(), ask_first=False)
+        return
     rec = oc_state().get("recommended")
     if not rec:
-        sys.exit("No OC test result that allows an OC: run ./elden-research oc-test")
-    if sudo_ready() and sudo_stream(["bash", str(LIB / "system-setup.sh"), "oc", str(rec["mhz"])]) == 0:
-        set_config(ER_OC=1)
-        say("ok", f"OC on: {rec['mhz']} MHz while the game runs.")
+        sys.exit("No OC step passed the test on this machine. ./elden-research oc-test tests again;\n"
+                 "./elden-research oc force uses a step anyway, at your own risk.")
+    enable_oc(rec["mhz"])
 
 
 def cmd_proton(args):

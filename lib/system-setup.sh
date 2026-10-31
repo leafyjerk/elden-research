@@ -5,6 +5,8 @@
 #   sudo lib/system-setup.sh install USER   tweaks, helpers, services, polkit rule
 #   sudo lib/system-setup.sh oc [MHZ]       er-oc.service at MHZ (default: the OC test's pick;
 #                                           only a step that passed the test on this machine)
+#   sudo lib/system-setup.sh oc MHZ force   any step up to 3800 MHz, passed or not (the user
+#                                           accepted the risk: elden-research oc force)
 #   sudo lib/system-setup.sh oc off         remove er-oc.service (no OC)
 #   sudo lib/system-setup.sh uninstall      undo everything above
 #
@@ -198,7 +200,7 @@ EOF
 }
 
 oc_unit() {
-  local mhz=${1:-} scale
+  local mhz=${1:-} force=${2:-} scale note=
   if [[ $mhz == off ]]; then
     systemctl stop er-oc.service 2> /dev/null || true
     rm -f $UNITS/er-oc.service
@@ -207,29 +209,42 @@ oc_unit() {
     echo "er-oc.service removed: stock clocks in the game too"
     return
   fi
-  # Only the OC test's pick, or a lower step that also passed it on this machine.
-  read -r mhz scale < <(python3 -I - "$OCSTATE" "$mhz" <<'EOF'
-import json, sys
+  # Only the OC test's pick, or a lower step that also passed it on this machine. With
+  # "force", any ladder step up to 3800 MHz with its usual curve; er-smu apply still
+  # checks the clock and the voltage cap at every launch.
+  read -r mhz scale < <(python3 -I - "$OCSTATE" "$mhz" "$force" "$HERE/er-smu.py" <<'EOF'
+import importlib.util, json, sys
+path, arg, force, smu = sys.argv[1:]
+if force == "force":
+    spec = importlib.util.spec_from_file_location("er_smu", smu)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    ladder = {f: s for f, s in m.LADDER if f <= 3800}
+    if not arg.isdigit() or int(arg) not in ladder:
+        sys.exit("oc MHZ force: MHZ is one of " + ", ".join(map(str, ladder)))
+    print(arg, ladder[int(arg)])
+    sys.exit()
 try:
-    st = json.load(open(sys.argv[1]))
+    st = json.load(open(path))
 except (OSError, ValueError):
     sys.exit("no OC test result yet: run elden-research oc-test")
 rec = st.get("recommended")
 if not rec:
     sys.exit("the OC test didn't recommend an OC on this machine: " + str(st.get("result")))
-mhz = int(sys.argv[2] or rec["mhz"])
+mhz = int(arg or rec["mhz"])
 ok = [s for s in st.get("steps", []) if s.get("ok") and s["mhz"] == mhz and mhz <= rec["mhz"]]
 if not ok:
     sys.exit(f"{mhz} MHz isn't the OC test's pick ({rec['mhz']} MHz) or a lower step that passed it")
 print(mhz, rec["scale"] if mhz == rec["mhz"] else ok[-1]["scale"])
 EOF
   ) && [[ -n ${scale:-} ]] || exit 1
+  [[ $force != force ]] || note=", forced: the OC test didn't pass it"
   put $UNITS/er-oc.service 644 <<EOF
 # elden-research: started by er-launch.sh when Elden Ring starts and stopped when it
 # exits, so no other game runs overclocked. No [Install] section on purpose: it must
 # never run at boot (a bad OC then still ends with a power cycle).
 [Unit]
-Description=BC-250 CPU overclock while Elden Ring runs: $mhz MHz, VID curve scale $scale (elden-research)
+Description=BC-250 CPU overclock while Elden Ring runs: $mhz MHz, VID curve scale $scale (elden-research$note)
 
 [Service]
 Type=oneshot
@@ -238,7 +253,7 @@ ExecStart=/usr/local/bin/er-smu apply $mhz $scale
 ExecStop=/usr/local/bin/er-smu stock
 EOF
   systemctl daemon-reload
-  echo "er-oc.service: $mhz MHz, VID curve scale $scale, only while the game runs"
+  echo "er-oc.service: $mhz MHz, VID curve scale $scale, only while the game runs${note:+ (forced)}"
 }
 
 uninstall_all() {
@@ -268,8 +283,8 @@ uninstall_all() {
 }
 
 case ${1:-} in
-  install) [[ -n ${2:-} ]] || { sed -n 5,9p "$0"; exit 1; }; install_all "$2" ;;
-  oc) oc_unit "${2:-}" ;;
+  install) [[ -n ${2:-} ]] || { sed -n 5,11p "$0"; exit 1; }; install_all "$2" ;;
+  oc) oc_unit "${2:-}" "${3:-}" ;;
   uninstall) uninstall_all ;;
-  *) sed -n 5,9p "$0"; exit 1 ;;
+  *) sed -n 5,11p "$0"; exit 1 ;;
 esac
