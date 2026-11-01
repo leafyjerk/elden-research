@@ -172,7 +172,7 @@ The filler case (limited by the reorder buffer) is 16% faster with the sibling o
 | Sibling online | 55.6 | 48.2 | 38.2 | 2.3% | 0.630 |
 | **Sibling offline** | **56.6** | **50.4** | **42.5** | **0.8%** | **0.673 (+7%)** |
 
-Every 20 s window was higher. This was a single pair, measured before we knew about save drift (section 3), but the mechanism is confirmed by membench, and it stayed in every later run. The launcher takes the sibling offline before scx_lavd starts, because sched_ext schedulers don't take CPU hotplug well, and brings it back after the game exits.
+Every 20 s window was higher. This was a single pair, measured before we knew about save drift (section 3), but the mechanism is confirmed by membench, and it stayed in every later run. The launcher takes the sibling offline 60 s after the game appears, then starts scx_lavd (sched_ext schedulers don't take CPU hotplug well), and brings it back after the game exits. The delay matters: when Wine started with the sibling already offline, it saw 15 CPUs and the game died in its sound init (Wwise thread setup).
 
 ### 4.9 Proton: CachyOS beats Experimental (2026-10-30)
 

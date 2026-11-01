@@ -130,7 +130,7 @@ profile_threads() {
 # Prints "<output> <current mode id> <mode id at $1 Hz, same resolution>" for
 # the first enabled output, from kscreen-doctor's "Modes: 1:1920x1080@60.00! 2:...*" line.
 display_modes() {
-  env -u LD_PRELOAD kscreen-doctor -o 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | awk -v hz="$1" '
+  env -u LD_PRELOAD timeout 5 kscreen-doctor -o 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | awk -v hz="$1" '
     /^Output:/ {name = $3; on = 0}
     /^[ \t]+enabled/ {on = 1}
     on && /Modes:/ {
@@ -187,25 +187,6 @@ watch_game() {
 
   ((ER_RECLAIM)) && reclaim_apps
   systemctl start --no-ask-password er-boost.service 2> /dev/null && echo "memory compacted"
-  # Before scx_lavd starts: sched_ext schedulers don't take CPU hotplug well.
-  if ((ER_SMT_OFF)); then
-    sib=$(tr ',-' '\n\n' < /sys/devices/system/cpu/cpu"$main"/topology/thread_siblings_list | grep -vx "$main" | head -1)
-    if [[ -z $sib ]]; then
-      echo "CPU $main has no online sibling (already offline?)"
-    else
-      systemctl start --no-ask-password "er-offline@$sib.service" && echo "CPU $sib (main thread's sibling) offline" || sib=
-    fi
-  fi
-
-  if ((!ER_SCX)); then
-    echo "kernel scheduler (ER_SCX=0)"
-  elif ! command -v scxctl > /dev/null; then
-    echo "scxctl not found (scx-tools package): kernel scheduler"
-  elif scxctl get 2>&1 | grep -q 'no scx'; then
-    scxctl start -s lavd && started_scx=1 && echo "scx_lavd started"
-  else
-    echo "scheduler already running: $(scxctl get)"
-  fi
 
   for ((i = 0; i < 150; i++)); do   # up to 5 min for the game to appear
     pid=$(pgrep -x eldenring.exe | head -1) && [[ -n $pid ]] && break
@@ -216,6 +197,29 @@ watch_game() {
   else
     echo "found PID $pid, pinning in ${LOAD_WAIT}s"
     sleep "$LOAD_WAIT"
+    # The sibling goes offline only now, with the game up. When Wine started with it
+    # already offline (Game Mode, where nothing delays the launch), Wine saw 15 CPUs
+    # and the game died in its sound init (Wwise thread setup, 2026-11-01).
+    # Before scx_lavd starts: sched_ext schedulers don't take CPU hotplug well.
+    if kill -0 "$pid" 2> /dev/null; then
+      if ((ER_SMT_OFF)); then
+        sib=$(tr ',-' '\n\n' < /sys/devices/system/cpu/cpu"$main"/topology/thread_siblings_list | grep -vx "$main" | head -1)
+        if [[ -z $sib ]]; then
+          echo "CPU $main has no online sibling (already offline?)"
+        else
+          systemctl start --no-ask-password "er-offline@$sib.service" && echo "CPU $sib (main thread's sibling) offline" || sib=
+        fi
+      fi
+      if ((!ER_SCX)); then
+        echo "kernel scheduler (ER_SCX=0)"
+      elif ! command -v scxctl > /dev/null; then
+        echo "scxctl not found (scx-tools package): kernel scheduler"
+      elif scxctl get 2>&1 | grep -q 'no scx'; then
+        scxctl start -s lavd && started_scx=1 && echo "scx_lavd started"
+      else
+        echo "scheduler already running: $(scxctl get)"
+      fi
+    fi
     taskset -p -c "$main" "$pid" >/dev/null && echo "main thread -> CPU $main, render -> $gx, others -> $rest"
     if [[ -n $ER_WS ]]; then
       for i in $(pgrep -x wineserver); do
@@ -265,7 +269,7 @@ watch_game() {
   systemctl is-active --quiet er-oc.service && systemctl stop --no-ask-password er-oc.service &&
     echo "CPU OC off (stock clocks)"
   if [[ -n $ER_RESTORE_MODE ]]; then
-    env -u LD_PRELOAD kscreen-doctor "output.${ER_RESTORE_MODE% *}.mode.${ER_RESTORE_MODE#* }" >/dev/null 2>&1 &&
+    env -u LD_PRELOAD timeout 5 kscreen-doctor "output.${ER_RESTORE_MODE% *}.mode.${ER_RESTORE_MODE#* }" >/dev/null 2>&1 &&
       echo "display restored to mode ${ER_RESTORE_MODE#* }"
   fi
 }
@@ -311,10 +315,14 @@ if ((ER_OC)); then
     echo "CPU OC failed, running stock (journalctl -u er-oc)" >> "$LOG"
   fi
 fi
-if [[ -n $ER_REFRESH ]] && command -v kscreen-doctor > /dev/null &&
+# Game Mode (gamescope session): gamescope owns the display, and kscreen-doctor,
+# with no KDE session to talk to, never exited (the launch sat for 3 min, 2026-11-01).
+if [[ -n $ER_REFRESH && -n $GAMESCOPE_WAYLAND_DISPLAY ]]; then
+  echo "display: Game Mode (gamescope), refresh left to Steam" >> "$LOG"
+elif [[ -n $ER_REFRESH ]] && command -v kscreen-doctor > /dev/null &&
   read -r out cur want < <(display_modes "$ER_REFRESH") &&
   [[ -n $want && $want != "$cur" ]] &&
-  env -u LD_PRELOAD kscreen-doctor "output.$out.mode.$want" >/dev/null 2>&1; then
+  env -u LD_PRELOAD timeout 5 kscreen-doctor "output.$out.mode.$want" >/dev/null 2>&1; then
   export ER_RESTORE_MODE="$out $cur"
   echo "display $out -> ${ER_REFRESH} Hz (mode $want, was $cur)" >> "$LOG"
 fi
