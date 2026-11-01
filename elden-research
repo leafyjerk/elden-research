@@ -337,7 +337,7 @@ ER_RECLAIM=1
 # Display refresh rate while playing (KDE Plasma only; empty = leave it alone).
 ER_REFRESH=60
 # 1 = MangoHud overlay visible (Shift_R+F12 toggles it; the FPS log runs either way).
-ER_HUD=1
+ER_HUD=0
 # 1 = research profile 220 s into each session (needs perf; costs ~1 FPS while it runs).
 ER_PROFILE=0
 """

@@ -47,7 +47,7 @@ Each number was measured against the setup of its time, in the order we found th
 | 8 | **Thread layout + interrupts on CPUs 0–1** | while the game runs (interrupts: from boot) | Light game threads share the main thread's CCX, render threads get the other CCX, and the desktop and interrupts get core 0 | Avg 49.6 → 52.6; frames >20 ms 50.6% → 21.1% |
 | 9 | **Memory tuning**: swappiness 10, earlier kswapd, compaction at launch, faster huge pages, other apps pushed to swap at launch | permanent (sysctls, boot) and at launch | The game's memory stays in RAM, ~2/3 of it on 2 MB pages | Worst frame 786 → 49 ms; 1% low 38.1 → 43.2 |
 | 10 | **60 Hz while playing** (KDE Plasma) | while the game runs | The game caps at 60; on a 75 Hz desktop every 4th frame was shown twice | Smoother (judder gone; FPS unchanged) |
-| 11 | **Lean MangoHud config + session logs** | while the game runs | Small overlay, and an FPS log of each session for `./elden-research status` | – |
+| 11 | **Lean MangoHud config + session logs** | while the game runs | FPS log of each session for `./elden-research status` | – |
 
 Not done by this tool: **unlocking all 8 CPU cores** (a modded BIOS). It was the biggest single step, 54.8 → 58.1 FPS in the open world. See [8 cores](#8-cores).
 
@@ -149,7 +149,7 @@ The test is a screening, not a guarantee. Its load heats the CPU about as much a
 | `ER_RECLAIM` | 1 | Push other apps' memory to swap at launch |
 | `ER_REFRESH` | 60 | Display refresh while playing (KDE only; empty = leave it) |
 | `ER_FPS` | – | e.g. 50: cap at 50 FPS with the display at 50 Hz |
-| `ER_HUD` | 1 | MangoHud overlay visible (Shift_R+F12 toggles it; the log runs either way) |
+| `ER_HUD` | 0 | MangoHud overlay visible (Shift_R+F12 toggles it; the log runs either way) |
 | `ER_PROFILE` | 0 | 1 = research profile 220 s into the session (needs `perf`; costs ~1 FPS while it runs) |
 
 ## Commands

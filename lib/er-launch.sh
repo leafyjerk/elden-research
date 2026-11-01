@@ -55,7 +55,7 @@ ER_SCX=${ER_SCX:-1}          # 0 = keep the kernel's own scheduler instead of sc
 ER_SMT_OFF=${ER_SMT_OFF:-1}  # 1 = main thread's SMT sibling offline while playing
 ER_OC=${ER_OC:-0}            # 1 = er-oc.service while the game runs (set by the OC safety test)
 ER_OC_TMAX=${ER_OC_TMAX:-88} # thermal guard: OC off after 15 s at or above this Tctl (C)
-ER_HUD=${ER_HUD:-1}          # 0 = MangoHud overlay hidden (Shift_R+F12 shows it; the FPS log still runs)
+ER_HUD=${ER_HUD:-0}          # 1 = MangoHud overlay visible (Shift_R+F12 toggles it; the FPS log runs either way)
 ER_PROFILE=${ER_PROFILE:-0}  # 1 = research profile 220 s in (perf, wait trace; costs ~1 FPS while it runs)
 # ER_WS=0-1,4-7: wineserver on these CPUs (the main thread's L3), so the main
 # thread's ~7k requests/s don't cross L3s; empty = left to the scheduler.
